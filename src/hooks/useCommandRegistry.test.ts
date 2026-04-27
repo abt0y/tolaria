@@ -737,6 +737,8 @@ describe('reload-vault command', () => {
       aiAgentsStatus: {
         claude_code: { status: 'installed', version: '1.0.20' },
         codex: { status: 'installed', version: '0.37.0' },
+        pi: { status: 'missing', version: null },
+        devin: { status: 'missing', version: null },
       },
       selectedAiAgent: 'claude_code',
       onSetDefaultAiAgent,
@@ -757,6 +759,8 @@ describe('reload-vault command', () => {
       aiAgentsStatus: {
         claude_code: { status: 'installed', version: '1.0.20' },
         codex: { status: 'missing', version: null },
+        pi: { status: 'missing', version: null },
+        devin: { status: 'missing', version: null },
       },
       selectedAiAgent: 'claude_code',
       onSetDefaultAiAgent: vi.fn(),
