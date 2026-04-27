@@ -12,6 +12,8 @@ vi.mock('../../utils/url', async () => {
 const installedStatuses = {
   claude_code: { status: 'installed' as const, version: '1.0.20' },
   codex: { status: 'installed' as const, version: '0.37.0' },
+  pi: { status: 'installed' as const, version: '0.1.0' },
+  devin: { status: 'installed' as const, version: '1.3.3' },
 }
 
 function render(ui: ReactElement) {

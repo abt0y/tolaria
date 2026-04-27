@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 pub enum AiAgentId {
     ClaudeCode,
     Codex,
+    Pi,
+    Devin,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,6 +22,8 @@ pub struct AiAgentAvailability {
 pub struct AiAgentsStatus {
     pub claude_code: AiAgentAvailability,
     pub codex: AiAgentAvailability,
+    pub pi: AiAgentAvailability,
+    pub devin: AiAgentAvailability,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +67,8 @@ pub fn get_ai_agents_status() -> AiAgentsStatus {
     AiAgentsStatus {
         claude_code: availability_from_claude(),
         codex: availability_from_codex(),
+        pi: availability_from_pi(),
+        devin: availability_from_devin(),
     }
 }
 
@@ -84,7 +90,239 @@ where
             })
         }
         AiAgentId::Codex => run_codex_agent_stream(request, emit),
+        AiAgentId::Pi => run_pi_agent_stream(request, emit),
+        AiAgentId::Devin => run_devin_agent_stream(request, emit),
     }
+}
+
+fn availability_from_pi() -> AiAgentAvailability {
+    let binary = match find_pi_binary() {
+        Ok(binary) => binary,
+        Err(_) => {
+            return AiAgentAvailability {
+                installed: false,
+                version: None,
+            }
+        }
+    };
+
+    AiAgentAvailability {
+        installed: true,
+        version: version_for_binary(&binary),
+    }
+}
+
+fn availability_from_devin() -> AiAgentAvailability {
+    let binary = match find_devin_binary() {
+        Ok(binary) => binary,
+        Err(_) => {
+            return AiAgentAvailability {
+                installed: false,
+                version: None,
+            }
+        }
+    };
+
+    AiAgentAvailability {
+        installed: true,
+        version: version_for_binary(&binary),
+    }
+}
+
+fn run_pi_agent_stream<F>(request: AiAgentStreamRequest, mut emit: F) -> Result<String, String>
+where
+    F: FnMut(AiAgentStreamEvent),
+{
+    let binary = find_pi_binary()?;
+    let prompt = build_pi_prompt(&request);
+
+    let mut command = Command::new(binary);
+    command
+        .arg("--mode")
+        .arg("json")
+        .arg("--no-session") // Optional: depending on if we want persistence
+        .arg(prompt)
+        .current_dir(&request.vault_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to spawn pi: {error}"))?;
+
+    let stdout = child.stdout.take().ok_or("No stdout handle")?;
+    let reader = std::io::BufReader::new(stdout);
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                emit(AiAgentStreamEvent::Error {
+                    message: format!("Read error: {error}"),
+                });
+                break;
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let json = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(json) => json,
+            Err(_) => continue,
+        };
+
+        dispatch_pi_event(&json, &mut emit);
+    }
+
+    let stderr_output = child
+        .stderr
+        .take()
+        .and_then(|stderr| std::io::read_to_string(stderr).ok())
+        .unwrap_or_default();
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("Wait failed: {error}"))?;
+    if !status.success() {
+        emit(AiAgentStreamEvent::Error {
+            message: format_pi_error(stderr_output, status.to_string()),
+        });
+    }
+
+    emit(AiAgentStreamEvent::Done);
+
+    Ok(String::new()) // Pi might not provide a session ID in this mode
+}
+
+fn build_pi_prompt(request: &AiAgentStreamRequest) -> String {
+    match request
+        .system_prompt
+        .as_ref()
+        .map(|prompt| prompt.trim())
+        .filter(|prompt| !prompt.is_empty())
+    {
+        Some(system_prompt) => format!(
+            "System instructions:\n{system_prompt}\n\nUser request:\n{}",
+            request.message
+        ),
+        None => request.message.clone(),
+    }
+}
+
+fn dispatch_pi_event<F>(json: &serde_json::Value, emit: &mut F)
+where
+    F: FnMut(AiAgentStreamEvent),
+{
+    match json["type"].as_str().unwrap_or_default() {
+        "message_delta" => {
+            if let Some(text) = json["delta"]["text"].as_str() {
+                emit(AiAgentStreamEvent::TextDelta {
+                    text: text.to_string(),
+                });
+            }
+        }
+        "thought" => {
+            if let Some(text) = json["text"].as_str() {
+                emit(AiAgentStreamEvent::ThinkingDelta {
+                    text: text.to_string(),
+                });
+            }
+        }
+        "tool_call" => {
+            if let (Some(name), Some(id)) = (json["name"].as_str(), json["id"].as_str()) {
+                emit(AiAgentStreamEvent::ToolStart {
+                    tool_name: name.to_string(),
+                    tool_id: id.to_string(),
+                    input: json["input"].as_str().map(|i| i.to_string()),
+                });
+            }
+        }
+        "tool_result" => {
+            if let Some(id) = json["id"].as_str() {
+                emit(AiAgentStreamEvent::ToolDone {
+                    tool_id: id.to_string(),
+                    output: json["output"].as_str().map(|o| o.to_string()),
+                });
+            }
+        }
+        "error" => {
+            if let Some(message) = json["message"].as_str() {
+                emit(AiAgentStreamEvent::Error {
+                    message: message.to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn format_pi_error(stderr_output: String, status: String) -> String {
+    if stderr_output.trim().is_empty() {
+        format!("pi exited with status {status}")
+    } else {
+        stderr_output.lines().take(3).collect::<Vec<_>>().join("\n")
+    }
+}
+
+fn run_devin_agent_stream<F>(request: AiAgentStreamRequest, mut emit: F) -> Result<String, String>
+where
+    F: FnMut(AiAgentStreamEvent),
+{
+    let binary = find_devin_binary()?;
+
+    let mut command = Command::new(binary);
+    command
+        .arg("sessions")
+        .arg("create")
+        .arg("-t")
+        .arg(&request.message)
+        .current_dir(&request.vault_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to spawn devin: {error}"))?;
+
+    let stdout = child.stdout.take().ok_or("No stdout handle")?;
+    let reader = std::io::BufReader::new(stdout);
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => break,
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Without a proper JSON mode for the unofficial CLI, we just stream the output as text
+        emit(AiAgentStreamEvent::TextDelta {
+            text: format!("{}\n", line),
+        });
+    }
+
+    let stderr_output = child
+        .stderr
+        .take()
+        .and_then(|stderr| std::io::read_to_string(stderr).ok())
+        .unwrap_or_default();
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("Wait failed: {error}"))?;
+    if !status.success() && !stderr_output.is_empty() {
+        emit(AiAgentStreamEvent::Error {
+            message: stderr_output.lines().take(3).collect::<Vec<_>>().join("\n"),
+        });
+    }
+
+    emit(AiAgentStreamEvent::Done);
+
+    Ok(String::new())
 }
 
 fn availability_from_claude() -> AiAgentAvailability {
@@ -121,12 +359,44 @@ fn version_for_binary(binary: &PathBuf) -> Option<String> {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn find_codex_binary() -> Result<PathBuf, String> {
-    if let Some(binary) = find_codex_binary_on_path() {
+fn find_pi_binary() -> Result<PathBuf, String> {
+    if let Some(binary) = find_binary_on_path("pi") {
         return Ok(binary);
     }
 
-    if let Some(binary) = find_codex_binary_in_user_shell() {
+    if let Some(binary) = find_binary_in_user_shell("pi") {
+        return Ok(binary);
+    }
+
+    if let Some(binary) = find_existing_binary(pi_binary_candidates()) {
+        return Ok(binary);
+    }
+
+    Err("Pi CLI not found. Install it: npm install -g @mariozechner/pi-coding-agent".into())
+}
+
+fn find_devin_binary() -> Result<PathBuf, String> {
+    if let Some(binary) = find_binary_on_path("devin") {
+        return Ok(binary);
+    }
+
+    if let Some(binary) = find_binary_in_user_shell("devin") {
+        return Ok(binary);
+    }
+
+    if let Some(binary) = find_existing_binary(devin_binary_candidates()) {
+        return Ok(binary);
+    }
+
+    Err("Devin CLI not found. Install it: https://docs.devin.ai/get-started/devin-intro".into())
+}
+
+fn find_codex_binary() -> Result<PathBuf, String> {
+    if let Some(binary) = find_binary_on_path("codex") {
+        return Ok(binary);
+    }
+
+    if let Some(binary) = find_binary_in_user_shell("codex") {
         return Ok(binary);
     }
 
@@ -137,19 +407,19 @@ fn find_codex_binary() -> Result<PathBuf, String> {
     Err("Codex CLI not found. Install it: https://developers.openai.com/codex/cli".into())
 }
 
-fn find_codex_binary_on_path() -> Option<PathBuf> {
+fn find_binary_on_path(command: &str) -> Option<PathBuf> {
     Command::new("which")
-        .arg("codex")
+        .arg(command)
         .output()
         .ok()
         .and_then(|output| path_from_successful_output(&output))
 }
 
-fn find_codex_binary_in_user_shell() -> Option<PathBuf> {
+fn find_binary_in_user_shell(command: &str) -> Option<PathBuf> {
     user_shell_candidates()
         .into_iter()
         .filter(|shell| shell.exists())
-        .find_map(|shell| command_path_from_shell(&shell, "codex"))
+        .find_map(|shell| command_path_from_shell(&shell, command))
 }
 
 fn user_shell_candidates() -> Vec<PathBuf> {
@@ -190,6 +460,44 @@ fn first_existing_path(stdout: &str) -> Option<PathBuf> {
         let candidate = PathBuf::from(trimmed);
         candidate.exists().then_some(candidate)
     })
+}
+
+fn pi_binary_candidates() -> Vec<PathBuf> {
+    dirs::home_dir()
+        .map(|home| pi_binary_candidates_for_home(&home))
+        .unwrap_or_default()
+}
+
+fn pi_binary_candidates_for_home(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".local/bin/pi"),
+        home.join(".npm-global/bin/pi"),
+        home.join(".npm/bin/pi"),
+        home.join(".bun/bin/pi"),
+        home.join(".local/share/mise/shims/pi"),
+        home.join(".asdf/shims/pi"),
+        PathBuf::from("/usr/local/bin/pi"),
+        PathBuf::from("/opt/homebrew/bin/pi"),
+    ]
+}
+
+fn devin_binary_candidates() -> Vec<PathBuf> {
+    dirs::home_dir()
+        .map(|home| devin_binary_candidates_for_home(&home))
+        .unwrap_or_default()
+}
+
+fn devin_binary_candidates_for_home(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".local/bin/devin"),
+        home.join(".npm-global/bin/devin"),
+        home.join(".npm/bin/devin"),
+        home.join(".bun/bin/devin"),
+        home.join(".local/share/mise/shims/devin"),
+        home.join(".asdf/shims/devin"),
+        PathBuf::from("/usr/local/bin/devin"),
+        PathBuf::from("/opt/homebrew/bin/devin"),
+    ]
 }
 
 fn codex_binary_candidates() -> Vec<PathBuf> {
@@ -439,10 +747,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_status_contains_both_agents() {
+    fn normalize_status_contains_all_agents() {
         let status = get_ai_agents_status();
         assert!(matches!(status.claude_code.installed, true | false));
         assert!(matches!(status.codex.installed, true | false));
+        assert!(matches!(status.pi.installed, true | false));
+        assert!(matches!(status.devin.installed, true | false));
     }
 
     #[test]
@@ -591,5 +901,100 @@ mod tests {
         let mapped = map_claude_event(crate::claude_cli::ClaudeStreamEvent::Done);
 
         assert!(matches!(mapped, Some(AiAgentStreamEvent::Done)));
+    }
+
+    #[test]
+    fn build_pi_prompt_keeps_system_prompt_first() {
+        let prompt = build_pi_prompt(&AiAgentStreamRequest {
+            agent: AiAgentId::Pi,
+            message: "Analyze the code".into(),
+            system_prompt: Some("Expert mode".into()),
+            vault_path: "/tmp/vault".into(),
+        });
+
+        assert!(prompt.starts_with("System instructions:\nExpert mode"));
+        assert!(prompt.contains("User request:\nAnalyze the code"));
+    }
+
+    #[test]
+    fn dispatch_pi_event_maps_text_delta() {
+        let mut events = Vec::new();
+        let json = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "text": "Hello "
+            }
+        });
+
+        dispatch_pi_event(&json, &mut |event| events.push(event));
+
+        assert!(matches!(
+            &events[0],
+            AiAgentStreamEvent::TextDelta { text } if text == "Hello "
+        ));
+    }
+
+    #[test]
+    fn dispatch_pi_event_maps_thought() {
+        let mut events = Vec::new();
+        let json = serde_json::json!({
+            "type": "thought",
+            "text": "I should read the file"
+        });
+
+        dispatch_pi_event(&json, &mut |event| events.push(event));
+
+        assert!(matches!(
+            &events[0],
+            AiAgentStreamEvent::ThinkingDelta { text } if text == "I should read the file"
+        ));
+    }
+
+    #[test]
+    fn dispatch_pi_event_maps_tool_calls() {
+        let mut events = Vec::new();
+        let call = serde_json::json!({
+            "type": "tool_call",
+            "id": "t1",
+            "name": "read_file",
+            "input": "README.md"
+        });
+        let result = serde_json::json!({
+            "type": "tool_result",
+            "id": "t1",
+            "output": "File content..."
+        });
+
+        dispatch_pi_event(&call, &mut |event| events.push(event));
+        dispatch_pi_event(&result, &mut |event| events.push(event));
+
+        assert!(matches!(
+            &events[0],
+            AiAgentStreamEvent::ToolStart { tool_name, tool_id, .. }
+                if tool_name == "read_file" && tool_id == "t1"
+        ));
+        assert!(matches!(
+            &events[1],
+            AiAgentStreamEvent::ToolDone { tool_id, output }
+                if tool_id == "t1" && output.as_deref() == Some("File content...")
+        ));
+    }
+
+    #[test]
+    fn pi_binary_candidates_contain_common_paths() {
+        let home = PathBuf::from("/Users/alice");
+        let candidates = pi_binary_candidates_for_home(&home);
+        assert!(candidates.contains(&home.join(".local/bin/pi")));
+        assert!(candidates.contains(&home.join(".npm/bin/pi")));
+        assert!(candidates.contains(&PathBuf::from("/usr/local/bin/pi")));
+    }
+
+    #[test]
+    fn devin_binary_candidates_contain_common_paths() {
+        let home = PathBuf::from("/Users/alice");
+        let candidates = devin_binary_candidates_for_home(&home);
+        assert!(candidates.contains(&home.join(".local/bin/devin")));
+        assert!(candidates.contains(&home.join(".npm/bin/devin")));
+        assert!(candidates.contains(&PathBuf::from("/usr/local/bin/devin")));
     }
 }

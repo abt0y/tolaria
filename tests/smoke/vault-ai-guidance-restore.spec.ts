@@ -32,6 +32,8 @@ test('vault guidance restore command recovers missing managed guidance', async (
         ref.get_ai_agents_status = () => ({
           claude_code: { installed: false, version: null },
           codex: { installed: true, version: '1.2.3' },
+          pi: { installed: false, version: null },
+          devin: { installed: false, version: null },
         })
         ref.get_vault_ai_guidance_status = () => ({ ...guidanceStatus })
         ref.restore_vault_ai_guidance = () => {
